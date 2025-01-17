@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html>
+	<title>Guacamole</title>
+	<head>
+		<link rel="stylesheet" type="text/css" href="styles.css">
+		
+		<script src="js/guacamole-common.min.js"></script>
+	</head>
+	<body>
+	</body>
+	<script>
+		//get instance id and token from args
+		const urlParams = new URLSearchParams(window.location.search);
+		const instanceID = urlParams.get('instance_id');
+		const guacToken = urlParams.get('guac_token');
+
+		var url = new URL("/desktop/" + instanceID + "/vnc/websockify", window.location.href);
+		var protocol = url.protocol == 'https:' ? 'wss:' : 'ws:';
+		var tunnel = new Guacamole.WebSocketTunnel(protocol + '//' + url.host + url.pathname);
+		var guac = new Guacamole.Client(tunnel);		
+
+		guac.onerror = function(error) {
+			console.log("Guacamole error: " + error);
+		};
+
+		//create canvas
+		var display = document.body.appendChild(guac.getDisplay().getElement());
+
+		guac.onstatechange = function(state) {
+			if (state === 2) {
+				OnGuacSuccess();
+			}
+		};
+
+		guac.connect('token=' + guacToken);
+
+		//display
+		function resizeDisplay() {
+			let GUAC_WIDTH  = Math.round(window.innerWidth);
+			let GUAC_HEIGHT = Math.round(window.innerHeight);
+			tunnel.sendMessage('size', GUAC_WIDTH, GUAC_HEIGHT)
+		}
+		window.onresize = resizeDisplay;
+		
+		setTimeout(() => {
+			resizeDisplay();
+		}, 500);
+		
+		//keyboard
+		var keyboard = new Guacamole.Keyboard(document);
+
+		keyboard.onkeydown = function (keysym) {
+			guac.sendKeyEvent(1, keysym);
+		};
+
+		keyboard.onkeyup = function (keysym) {
+			guac.sendKeyEvent(0, keysym);
+		};
+
+		//mouse
+		var mouse = new Guacamole.Mouse(guac.getDisplay().getElement());
+		mouse.onmousedown =
+		mouse.onmousemove =
+		mouse.onmouseup   = function(state) {
+			guac.sendMouseState(state);
+		};
+
+		function OnGuacSuccess() {
+			window.parent.postMessage({ action: 'connection_state', value: 'connected' }, '*');
+		}
+	</script>
+</html>
