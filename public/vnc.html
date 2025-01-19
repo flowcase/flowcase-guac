@@ -20,7 +20,7 @@
 		var guac = new Guacamole.Client(tunnel);		
 
 		guac.onerror = function(error) {
-			console.log("Guacamole error: " + error);
+			console.log("Guacamole error: " + error.message);
 		};
 
 		//create canvas
