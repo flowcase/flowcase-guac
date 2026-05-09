@@ -1,24 +1,21 @@
 //! WebSocket ↔ guacd bridge.
 //!
-//! Browser opens a WS to GET / with `?token=<b64>`. We decrypt the token
-//! (T1C.2), open a TCP connection to guacd (default 127.0.0.1:4822), run
-//! the Guacamole handshake (T1C.3), then splice bytes bidirectionally:
-//! browser WS frames → guacd; guacd protocol bytes → browser WS frames.
-//!
-//! Slow consumers on either side cause both halves of the bridge to
-//! tear down — the browser's guacamole-common.js will reconnect.
-
-#![allow(dead_code)] // module is fully consumed by main.rs in T1C.5
+//! Browser opens a WS to GET /vnc.html with `?guac_token=<b64>` (the
+//! orchestrator-generated URL is `/desktop/<id>/vnc/vnc.html?…`; behind
+//! the orchestrator's reverse proxy our bridge sees just `/vnc.html`).
+//! Without WS upgrade headers the same path serves `public/vnc.html`
+//! verbatim. With WS upgrade we decrypt the token (T1C.2), open guacd
+//! (T1C.3), and splice bytes both ways.
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
-use axum::response::Response;
-use axum::routing::get;
-use axum::Router;
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -28,41 +25,53 @@ use tracing::{debug, info, warn};
 use crate::guacd::handshake;
 use crate::token::decrypt_token;
 
-/// Shared state for the bridge router.
+/// Shared state for the bridge router. Must be cloneable and Send + 'static
+/// so axum can stash it in every request.
 #[derive(Clone)]
 pub struct BridgeState {
     pub key: Arc<[u8; 32]>,
     pub guacd_addr: SocketAddr,
+    pub public_dir: Arc<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
-struct TokenQuery {
-    token: String,
+pub struct TokenQuery {
+    /// Browser uses `guac_token` in the query string (see
+    /// flowcase/static/js/droplet/main.js:17). The legacy guacamole-lite
+    /// also accepted `token`, so we deserialize either.
+    #[serde(alias = "guac_token")]
+    pub token: String,
 }
 
-pub fn router(state: BridgeState) -> Router {
-    Router::new().route("/", get(handle_ws)).with_state(state)
-}
-
-async fn handle_ws(
-    ws: WebSocketUpgrade,
+/// Handler for GET /vnc.html. Branches on whether the request carries
+/// WebSocket upgrade headers:
+///   * upgrade present → decrypt token, hand off to guacd bridge
+///   * no upgrade      → serve public/vnc.html as text/html
+///
+/// `Option<WebSocketUpgrade>` extracts to None when upgrade headers are
+/// missing instead of rejecting the request.
+pub async fn handle_vnc_html(
+    upgrade: Option<WebSocketUpgrade>,
+    query: Option<Query<TokenQuery>>,
     State(state): State<BridgeState>,
-    Query(q): Query<TokenQuery>,
 ) -> Response {
-    let conn = match decrypt_token(&q.token, &state.key) {
+    let Some(ws) = upgrade else {
+        return serve_vnc_html(&state.public_dir).await;
+    };
+
+    let token = match query {
+        Some(Query(q)) => q.token,
+        None => {
+            warn!("WS upgrade with no token query param");
+            return ws.on_upgrade(|s| close_with(s, 4002, "Missing token"));
+        }
+    };
+
+    let conn = match decrypt_token(&token, &state.key) {
         Ok(c) => c,
         Err(err) => {
             warn!(?err, "rejecting WS upgrade: token decrypt failed");
-            // Match guacamole-lite behavior — accept the upgrade and close
-            // immediately so the browser learns it via a WS close.
-            return ws.on_upgrade(|mut s| async move {
-                let _ = s
-                    .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                        code: 4002,
-                        reason: std::borrow::Cow::Borrowed("Invalid Token"),
-                    })))
-                    .await;
-            });
+            return ws.on_upgrade(|s| close_with(s, 4002, "Invalid Token"));
         }
     };
 
@@ -78,6 +87,26 @@ async fn handle_ws(
             warn!(?err, "bridge ended with error");
         }
     })
+}
+
+async fn close_with(mut socket: WebSocket, code: u16, reason: &'static str) {
+    let _ = socket
+        .send(Message::Close(Some(CloseFrame {
+            code,
+            reason: std::borrow::Cow::Borrowed(reason),
+        })))
+        .await;
+}
+
+async fn serve_vnc_html(public_dir: &Path) -> Response {
+    let path = public_dir.join("vnc.html");
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], bytes).into_response(),
+        Err(err) => {
+            warn!(?err, path=%path.display(), "vnc.html read failed");
+            (StatusCode::NOT_FOUND, "vnc.html not found").into_response()
+        }
+    }
 }
 
 async fn run_bridge(
@@ -109,7 +138,7 @@ async fn run_bridge(
                     }
                 }
                 Ok(Message::Close(_)) | Err(_) => break,
-                _ => {} // ignore Ping/Pong (axum auto-responds)
+                _ => {} // Ping/Pong handled by axum
             }
         }
         debug!("ws -> guacd half closed");
@@ -117,8 +146,8 @@ async fn run_bridge(
     });
 
     // guacd → browser: read raw bytes from guacd, ship as WS Text frames.
-    // Note: we use the buffered reader's underlying half via into_inner so
-    // we don't waste cycles re-parsing; guacamole-common.js buffers on the
+    // We use the buffered reader's underlying half via into_inner so we
+    // don't waste cycles re-parsing; guacamole-common.js buffers on the
     // browser side and tolerates partial instructions.
     let from_guacd = tokio::spawn(async move {
         let mut inner = reader.into_inner();
@@ -132,10 +161,6 @@ async fn run_bridge(
                     break;
                 }
             };
-            // Guac protocol is UTF-8 by spec; if we ever hit invalid bytes
-            // it's a guacd bug, not ours. Forward as Text either way:
-            // axum::Message::Text would reject invalid UTF-8, so coerce
-            // via from_utf8_lossy and log if we had to substitute.
             let text = match std::str::from_utf8(&buf[..n]) {
                 Ok(s) => s.to_string(),
                 Err(err) => {
@@ -151,8 +176,6 @@ async fn run_bridge(
         let _ = ws_sink.send(Message::Close(None)).await;
     });
 
-    // Whichever direction closes first ends the session. Wait for both
-    // halves so we don't leak the inner read/write halves.
     tokio::select! {
         _ = to_guacd => {},
         _ = from_guacd => {},
@@ -161,63 +184,64 @@ async fn run_bridge(
     Ok(())
 }
 
-#[allow(dead_code)] // trivial wrapper used only by main.rs in T1C.5
-pub fn build_state(key: [u8; 32], guacd_addr: SocketAddr) -> BridgeState {
-    BridgeState {
-        key: Arc::new(key),
-        guacd_addr,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
+    use axum::body::{to_bytes, Body};
     use axum::http::Request;
+    use axum::routing::get;
+    use axum::Router;
+    use tempfile::TempDir;
     use tower::ServiceExt;
 
-    fn dummy_key() -> Arc<[u8; 32]> {
-        Arc::new(*b"this-is-a-32-byte-test-key!12345")
-    }
-
-    #[tokio::test]
-    async fn bad_token_rejects_with_close_frame() {
+    fn dummy_state() -> (BridgeState, TempDir) {
+        let dir = tempfile::tempdir().unwrap();
         let state = BridgeState {
-            key: dummy_key(),
-            guacd_addr: "127.0.0.1:1".parse().unwrap(), // never reached
-        };
-        let app = router(state);
-
-        // No WS upgrade headers — axum will return 400 before we even decode
-        // the token. Use that as the proxy: the route is wired and the
-        // query extractor sees the param.
-        let req = Request::builder()
-            .method("GET")
-            .uri("/?token=garbage")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        // axum 0.7 returns 426/400 for missing upgrade headers; the exact
-        // code is plumbing — just assert we got a non-2xx without panicking.
-        assert!(!resp.status().is_success());
-    }
-
-    #[tokio::test]
-    async fn missing_token_returns_400() {
-        let state = BridgeState {
-            key: dummy_key(),
+            key: Arc::new(*b"this-is-a-32-byte-test-key!12345"),
             guacd_addr: "127.0.0.1:1".parse().unwrap(),
+            public_dir: Arc::new(dir.path().to_path_buf()),
         };
-        let app = router(state);
+        (state, dir)
+    }
+
+    fn app(state: BridgeState) -> Router {
+        Router::new()
+            .route("/vnc.html", get(handle_vnc_html))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn plain_get_serves_vnc_html() {
+        let (state, dir) = dummy_state();
+        std::fs::write(dir.path().join("vnc.html"), b"<html>OK</html>").unwrap();
 
         let req = Request::builder()
             .method("GET")
-            .uri("/")
+            .uri("/vnc.html")
             .body(Body::empty())
             .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        // axum's Query<T> rejects missing fields with 400.
-        assert_eq!(resp.status().as_u16(), 400);
+        let resp = app(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .map(|v| v.to_str().unwrap()),
+            Some("text/html; charset=utf-8")
+        );
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(body.as_ref(), b"<html>OK</html>");
+    }
+
+    #[tokio::test]
+    async fn missing_vnc_html_returns_404() {
+        let (state, _dir) = dummy_state();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/vnc.html")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     /// Live integration test against a real guacd + VNC server.
@@ -236,11 +260,9 @@ mod tests {
         use futures_util::StreamExt as _;
         use tokio_tungstenite::tungstenite::Message as TM;
 
-        // The token used by token::tests already encrypts a vnc connection
-        // to host="10.0.0.42":5901. Re-encrypt fresh for the test docker
-        // setup (host "vnc-smoke") so guacd can actually reach it. We
-        // generate the token with Node alongside the test docs in T1C.2;
-        // here we encrypt inline using the same primitives.
+        // Encrypt a fresh AES-256-CBC token in-process. Same primitive
+        // and key the orchestrator uses, so a successful round-trip here
+        // proves wire compatibility with droplet.py's encrypt_token.
         use aes::Aes256;
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
@@ -273,25 +295,24 @@ mod tests {
         .to_string();
         let token = B64.encode(envelope.as_bytes());
 
+        let dir = tempfile::tempdir().unwrap();
         let state = BridgeState {
             key: Arc::new(key),
             guacd_addr: "127.0.0.1:14822".parse().unwrap(),
+            public_dir: Arc::new(dir.path().to_path_buf()),
         };
 
-        // Boot bridge on an ephemeral port.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, router(state)).await.unwrap();
+            axum::serve(listener, app(state)).await.unwrap();
         });
 
-        let url = format!("ws://{addr}/?token={token}");
+        let url = format!("ws://{addr}/vnc.html?guac_token={token}");
         let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
             .await
             .expect("ws connect");
 
-        // Expect at least one Guac instruction frame (e.g. `args` reply or
-        // `ready` already arrives via the bridge's read pump).
         let frame = tokio::time::timeout(std::time::Duration::from_secs(15), ws.next())
             .await
             .expect("ws timed out")
@@ -307,11 +328,7 @@ mod tests {
             other => panic!("expected text frame, got {other:?}"),
         }
 
-        // Send a noop-ish frame to exercise the upstream half. Guacamole's
-        // sync instruction needs a timestamp; just send a heartbeat.
         ws.send(TM::Text("4.sync,1.0;".into())).await.unwrap();
-
-        // Don't expect a specific reply; tear down.
         let _ = ws.close(None).await;
     }
 }

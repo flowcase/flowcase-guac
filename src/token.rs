@@ -15,7 +15,6 @@ pub enum ConnectionKind {
 }
 
 impl ConnectionKind {
-    #[allow(dead_code)] // wired up in T1C.3 (guacd handshake)
     pub fn protocol_name(self) -> &'static str {
         match self {
             ConnectionKind::Vnc => "vnc",
@@ -92,7 +91,6 @@ fn deserialize_port<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u16, D::Er
 /// ```text
 /// b64_token = b64( json({"iv": b64(16-byte IV), "value": b64(AES-256-CBC(pkcs7(json(connection))))}) )
 /// ```
-#[allow(dead_code)] // wired up in T1C.4
 pub fn decrypt_token(b64_token: &str, key: &[u8; 32]) -> Result<GuacConnection> {
     let envelope_bytes = B64
         .decode(b64_token.trim())

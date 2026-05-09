@@ -24,3 +24,4 @@ futures-util = { version = "0.3", default-features = false }
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = "0.24"
+tempfile = "3.13"

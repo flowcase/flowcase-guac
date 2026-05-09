@@ -144,7 +144,6 @@ impl<R: tokio::io::AsyncRead + Unpin> GuacdReader<R> {
         }
     }
 
-    #[allow(dead_code)] // used by T1C.4 bridge to recover the underlying reader
     pub fn into_inner(self) -> BufReader<R> {
         self.inner
     }
@@ -153,7 +152,6 @@ impl<R: tokio::io::AsyncRead + Unpin> GuacdReader<R> {
 /// Run the guacd handshake for `conn` over an already-connected `stream`.
 /// Returns the underlying stream split into a reader/writer pair, ready
 /// for bidirectional protocol traffic.
-#[allow(dead_code)] // wired up in T1C.4
 pub async fn handshake(
     stream: TcpStream,
     conn: &GuacConnection,

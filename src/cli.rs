@@ -3,7 +3,6 @@ use clap::Parser;
 /// Length of the AES-256-CBC key used to encrypt guac connection tokens.
 /// Tokens are issued by the orchestrator at
 /// flowcase/routes/droplet.py:595-614 and consumed by us at T1C.2.
-#[allow(dead_code)] // used by token decryption (T1C.2) and main.rs (T1C.5)
 pub const AES_KEY_LEN: usize = 32;
 
 #[derive(Parser, Debug, Clone)]
@@ -28,7 +27,6 @@ pub struct Cli {
 impl Cli {
     /// Coerce the CLI key to a fixed 32-byte array, returning a clap error
     /// if it isn't exactly the right length.
-    #[allow(dead_code)] // wired up in T1C.5
     pub fn key_bytes(&self) -> Result<[u8; AES_KEY_LEN], KeyLenError> {
         let bytes = self.key.as_bytes();
         if bytes.len() != AES_KEY_LEN {
@@ -45,7 +43,6 @@ impl Cli {
 
 #[derive(Debug, thiserror::Error)]
 #[error("AES key must be {expected} bytes, got {got}")]
-#[allow(dead_code)] // surfaced via key_bytes in T1C.5
 pub struct KeyLenError {
     pub got: usize,
     pub expected: usize,
