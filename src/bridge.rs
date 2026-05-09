@@ -126,19 +126,14 @@ async fn run_bridge(
     // Browser → guacd: take WS Text/Binary payload bytes, write to guacd.
     let to_guacd = tokio::spawn(async move {
         while let Some(msg) = ws_stream.next().await {
-            match msg {
-                Ok(Message::Text(t)) => {
-                    if writer.write_all(t.as_bytes()).await.is_err() {
-                        break;
-                    }
-                }
-                Ok(Message::Binary(b)) => {
-                    if writer.write_all(&b).await.is_err() {
-                        break;
-                    }
-                }
+            let payload: Vec<u8> = match msg {
+                Ok(Message::Text(t)) => t.into_bytes(),
+                Ok(Message::Binary(b)) => b,
                 Ok(Message::Close(_)) | Err(_) => break,
-                _ => {} // Ping/Pong handled by axum
+                _ => continue, // Ping/Pong handled by axum
+            };
+            if writer.write_all(&payload).await.is_err() {
+                break;
             }
         }
         debug!("ws -> guacd half closed");
