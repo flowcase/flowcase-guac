@@ -1,4 +1,5 @@
 mod cli;
+mod token;
 
 use clap::Parser;
 
