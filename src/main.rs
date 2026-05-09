@@ -1,4 +1,5 @@
 mod cli;
+mod guacd;
 mod token;
 
 use clap::Parser;
