@@ -7,66 +7,194 @@
 		<script src="js/guacamole-common.min.js"></script>
 	</head>
 	<body>
+		<div id="credentials" class="credentials" style="display: none;">
+			<form id="credentials-form" class="credentials-form">
+				<h2>Sign in to the remote machine</h2>
+				<p id="credentials-message" class="credentials-message"></p>
+				<label id="credentials-username-label">Username
+					<input type="text" id="credentials-username" autocomplete="off">
+				</label>
+				<label id="credentials-password-label">Password
+					<input type="password" id="credentials-password" autocomplete="off">
+				</label>
+				<button type="submit">Connect</button>
+			</form>
+		</div>
 	</body>
 	<script>
 		//get instance id and token from args
 		const urlParams = new URLSearchParams(window.location.search);
 		const instanceID = urlParams.get('instance_id');
-		const guacToken = urlParams.get('guac_token');
+		const initialToken = urlParams.get('guac_token');
 
 		var url = new URL("/desktop/" + instanceID + "/vnc/websockify", window.location.href);
 		var protocol = url.protocol == 'https:' ? 'wss:' : 'ws:';
-		var tunnel = new Guacamole.WebSocketTunnel(protocol + '//' + url.host + url.pathname);
-		var guac = new Guacamole.Client(tunnel);		
 
-		guac.onerror = function(error) {
-			console.log("Guacamole error: " + error.message);
-		};
+		var tunnel = null;
+		var guac = null;
+		var display = null;
+		var mouse = null;
+		var connected = false;
+		var credentialsShown = false;
 
-		//create canvas
-		var display = document.body.appendChild(guac.getDisplay().getElement());
-
-		guac.onstatechange = function(state) {
-			if (state === 2) {
-				OnGuacSuccess();
+		function startClient(token) {
+			// Throw away the previous connection, if any
+			if (guac) {
+				guac.onerror = guac.onrequired = guac.onstatechange = null;
+				guac.disconnect();
+				display.remove();
 			}
-		};
 
-		guac.connect('token=' + guacToken);
+			connected = false;
+			credentialsShown = false;
+			tunnel = new Guacamole.WebSocketTunnel(protocol + '//' + url.host + url.pathname);
+			guac = new Guacamole.Client(tunnel);
+			display = document.body.appendChild(guac.getDisplay().getElement());
+
+			guac.onerror = function(error) {
+				console.log("Guacamole error: " + error.message);
+				// Before the session is up, any failure (wrong or missing login, unreachable host)
+				// lets the user enter credentials and try again
+				if (!connected) {
+					showCredentials(error.message || "Could not connect.", ["username", "password"]);
+				}
+			};
+
+			// guacd asks for parameters that were not provided (for example a missing password)
+			guac.onrequired = function(parameters) {
+				showCredentials("This machine needs a login.", parameters);
+			};
+
+			guac.onstatechange = function(state) {
+				if (state === 3) { // connected
+					connected = true;
+					hideCredentials();
+					OnGuacSuccess();
+				}
+			};
+
+			mouse = new Guacamole.Mouse(guac.getDisplay().getElement());
+			mouse.onmousedown =
+			mouse.onmousemove =
+			mouse.onmouseup   = function(state) {
+				// Pointer positions are in screen pixels; the remote desktop may be scaled to fit
+				var scale = guac.getDisplay().getScale();
+				var scaled = new Guacamole.Mouse.State(state);
+				scaled.x = state.x / scale;
+				scaled.y = state.y / scale;
+				guac.sendMouseState(scaled);
+			};
+
+			// Whenever the remote screen changes size, fit it into the window
+			guac.getDisplay().onresize = fitDisplay;
+
+			// Ask for a remote screen the size of the window from the start
+			guac.connect('token=' + encodeURIComponent(token) +
+				'&width=' + window.innerWidth + '&height=' + window.innerHeight + '&dpi=96');
+		}
 
 		//display
+		var resizeTimer = null;
 		function resizeDisplay() {
-			let GUAC_WIDTH  = Math.round(window.innerWidth);
-			let GUAC_HEIGHT = Math.round(window.innerHeight);
-			tunnel.sendMessage('size', GUAC_WIDTH, GUAC_HEIGHT)
+			// Wait for the user to stop dragging the window before asking the remote side to resize
+			window.clearTimeout(resizeTimer);
+			resizeTimer = window.setTimeout(function() {
+				if (guac && connected) {
+					guac.sendSize(window.innerWidth, window.innerHeight);
+				}
+			}, 300);
+			fitDisplay();
 		}
 		window.onresize = resizeDisplay;
-		
-		setTimeout(() => {
-			resizeDisplay();
-		}, 500);
-		
+
+		// Scale the remote screen to the window. Stays at 100% when the remote side follows the window size.
+		function fitDisplay() {
+			var d = guac.getDisplay();
+			var width = d.getWidth();
+			var height = d.getHeight();
+			if (!width || !height) return;
+			d.scale(Math.min(window.innerWidth / width, window.innerHeight / height));
+		}
+
+		// Guacamole.Keyboard captures every key on the document and swallows it for the remote session.
+		// While the credentials form is open, keep key events inside it. This listener must be added
+		// before the Keyboard below so it runs first.
+		['keydown', 'keyup', 'keypress'].forEach(function(type) {
+			document.addEventListener(type, function(event) {
+				if (credentialsShown && event.target.closest && event.target.closest('#credentials')) {
+					event.stopImmediatePropagation();
+				}
+			}, true);
+		});
+
 		//keyboard
 		var keyboard = new Guacamole.Keyboard(document);
 
 		keyboard.onkeydown = function (keysym) {
+			if (credentialsShown) return;
 			guac.sendKeyEvent(1, keysym);
 		};
 
 		keyboard.onkeyup = function (keysym) {
+			if (credentialsShown) return;
 			guac.sendKeyEvent(0, keysym);
 		};
 
-		//mouse
-		var mouse = new Guacamole.Mouse(guac.getDisplay().getElement());
-		mouse.onmousedown =
-		mouse.onmousemove =
-		mouse.onmouseup   = function(state) {
-			guac.sendMouseState(state);
-		};
+		//credentials prompt
+		function showCredentials(message, parameters) {
+			credentialsShown = true;
+			document.getElementById('credentials-message').innerText = message;
+			var askUsername = parameters.includes("username") || !parameters.includes("password");
+			var askPassword = parameters.includes("password") || !parameters.includes("username");
+			document.getElementById('credentials-username-label').style.display = askUsername ? '' : 'none';
+			document.getElementById('credentials-password-label').style.display = askPassword ? '' : 'none';
+			document.getElementById('credentials').style.display = 'flex';
+			document.getElementById(askUsername ? 'credentials-username' : 'credentials-password').focus();
+
+			// Let the parent page hide its loading screen
+			window.parent.postMessage({ action: 'connection_state', value: 'credentials_required' }, '*');
+		}
+
+		function hideCredentials() {
+			credentialsShown = false;
+			document.getElementById('credentials').style.display = 'none';
+		}
+
+		document.getElementById('credentials-form').addEventListener('submit', async function(event) {
+			event.preventDefault();
+
+			var body = {};
+			if (document.getElementById('credentials-username-label').style.display !== 'none') {
+				body.username = document.getElementById('credentials-username').value;
+			}
+			if (document.getElementById('credentials-password-label').style.display !== 'none') {
+				body.password = document.getElementById('credentials-password').value;
+			}
+			document.getElementById('credentials-password').value = '';
+
+			try {
+				// The server builds a new connection token containing these credentials
+				var response = await fetch('/api/instance/' + encodeURIComponent(instanceID) + '/guac_token', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify(body)
+				});
+				var json = await response.json();
+				if (!json.success) {
+					document.getElementById('credentials-message').innerText = json.error || "Could not retry.";
+					return;
+				}
+				hideCredentials();
+				startClient(json.token);
+			} catch (e) {
+				document.getElementById('credentials-message').innerText = "Could not retry: " + e;
+			}
+		});
 
 		function OnGuacSuccess() {
 			window.parent.postMessage({ action: 'connection_state', value: 'connected' }, '*');
 		}
+
+		startClient(initialToken);
 	</script>
 </html>
